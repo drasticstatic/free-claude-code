@@ -1,3 +1,7 @@
+---
+> **drasticstatic working copy** — Used by the [Anthropas-Argus-Alfred](https://github.com/drasticstatic/anthropas-argus-alfred) system. This is an independent repo created from a local clone of [Alishahryar1/free-claude-code](https://github.com/Alishahryar1/free-claude-code). Upstream is tracked as a remote for voluntary comparison — changes are reviewed before applying.
+---
+
 <div align="center">
 
 # 🤖 Free Claude Code
