@@ -1,0 +1,45 @@
+# Secrets — belt-and-suspenders
+.env
+.env.*
+!.env.example
+!.env.template
+*.key
+*.pem
+service_account.json
+credentials.json
+
+# Node / Python
+node_modules/
+bun.lockb
+venv/
+.venv/
+__pycache__/
+*.egg-info/
+
+# Build outputs
+dist/
+build/
+out/
+.next/
+
+# Runtime logs — grow quickly during proxy operation
+*.log
+
+# Binary media
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.mov
+
+# Agent session backups
+AGENT-SYNC/app-data-*/
+
+# Generated HTML presentations
+*.marp.html
+
+# Web3 (unused here but consistent baseline)
+artifacts/
+cache/
+forge-cache/
