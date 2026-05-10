@@ -1,5 +1,10 @@
----
 > **drasticstatic working copy** — Used by the [Anthropas-Argus-Alfred](https://github.com/drasticstatic/anthropas-argus-alfred) system. This is an independent repo created from a local clone of [Alishahryar1/free-claude-code](https://github.com/Alishahryar1/free-claude-code). Upstream is tracked as a remote for voluntary comparison — changes are reviewed before applying.
+>
+> ```bash
+> # Check for upstream updates (review before applying)
+> git fetch upstream && git log upstream/main --oneline
+> ```
+
 ---
 
 <div align="center">
@@ -15,6 +20,7 @@ Use Claude Code CLI, VS Code, JetBrains ACP, or chat bots through your own Anthr
 [![Type checking: Ty](https://img.shields.io/badge/type%20checking-ty-ffcc00.svg?style=for-the-badge)](https://pypi.org/project/ty/)
 [![Code style: Ruff](https://img.shields.io/badge/code%20formatting-ruff-f5a623.svg?style=for-the-badge)](https://github.com/astral-sh/ruff)
 [![Logging: Loguru](https://img.shields.io/badge/logging-loguru-4ecdc4.svg?style=for-the-badge)](https://github.com/Delgan/loguru)
+[![Tests](https://github.com/drasticstatic/free-claude-code/actions/workflows/tests.yml/badge.svg?style=for-the-badge)](https://github.com/drasticstatic/free-claude-code/actions/workflows/tests.yml)
 
 Free Claude Code routes Anthropic Messages API traffic from Claude Code to NVIDIA NIM, OpenRouter, DeepSeek, LM Studio, llama.cpp, or Ollama. It keeps Claude Code's client-side protocol stable while letting you choose free, paid, or local models.
 
