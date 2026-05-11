@@ -1310,6 +1310,7 @@ dependencies = [
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2e/f9/85f0bf863deed9078f3a25938a9f06206f98bcc39a6541a48cc97143db10/nvidia_riva_client-2.25.1-1-py3-none-any.whl", hash = "sha256:bde1232a8de3fe1561cccf49d3d0e6fe06190b1f0df4ad0ba118b9f5ae5a06aa", size = 55383, upload-time = "2026-04-30T10:27:58.381Z" },
+    { url = "https://files.pythonhosted.org/packages/27/c6/eb4acc0cb884c06109ea123d1c7dbb28974c9dddd73a624b1765a89e023e/nvidia_riva_client-2.25.1-2-py3-none-any.whl", hash = "sha256:5657680ab238b5930c07ce9a4a50d642524f25bff4099c1f818baaa8baad94fe", size = 55462, upload-time = "2026-05-06T12:30:02.948Z" },
     { url = "https://files.pythonhosted.org/packages/08/3b/b267af66a49c2e80e673b85ccd5484059b141be8031e4a4bb84ea4bcf31f/nvidia_riva_client-2.25.1-py3-none-any.whl", hash = "sha256:07c48c9cc7f3ca04cd988ad6d2205b0bcf3f6f25bb97d76b397e87cc696acc9f", size = 55371, upload-time = "2026-03-25T13:05:57.425Z" },
 ]
 
@@ -2233,11 +2234,11 @@ wheels = [
 
 [[package]]
 name = "urllib3"
-version = "2.6.3"
+version = "2.7.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c7/24/5f1b3bdffd70275f6661c76461e25f024d5a38a46f04aaca912426a2b1d3/urllib3-2.6.3.tar.gz", hash = "sha256:1b62b6884944a57dbe321509ab94fd4d3b307075e0c2eae991ac71ee15ad38ed", size = 435556, upload-time = "2026-01-07T16:24:43.925Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/53/0c/06f8b233b8fd13b9e5ee11424ef85419ba0d8ba0b3138bf360be2ff56953/urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c", size = 433602, upload-time = "2026-05-07T16:13:18.596Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/39/08/aaaad47bc4e9dc8c725e68f9d04865dbcb2052843ff09c97b08904852d84/urllib3-2.6.3-py3-none-any.whl", hash = "sha256:bf272323e553dfb2e87d9bfd225ca7b0f467b919d7bbd355436d3fd37cb0acd4", size = 131584, upload-time = "2026-01-07T16:24:42.685Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897", size = 131087, upload-time = "2026-05-07T16:13:17.151Z" },
 ]
 
 [[package]]
