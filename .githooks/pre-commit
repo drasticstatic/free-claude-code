@@ -1,0 +1,33 @@
+#!/bin/sh
+# pre-commit — chain to ggshield's secret scan.
+#
+# Real gap found 2026-09-14: ggshield installs itself via a GLOBAL
+# `core.hooksPath` (`~/Library/Application Support/ggshield/git-hooks/`). Once
+# a repo activates this fleet's own `.githooks/` via `core.hooksPath` (per
+# `scripts/install-hooks.sh`), that LOCAL setting takes precedence over the
+# global one — and since `.githooks/` had no `pre-commit` file, git simply
+# stopped looking for one at all. Net effect: activating the fleet's
+# commit-attribution hook silently disabled ggshield's secret scanning in
+# every repo it touched, with no warning at commit time. Found after running
+# `install-hooks.sh` fleet-wide and noticing ggshield's output had gone
+# quiet.
+#
+# This file closes that gap by re-chaining to ggshield explicitly, matching
+# what its own global hook does (see the file above, if it's on your
+# machine). Installed via core.hooksPath alongside commit-msg — no separate
+# activation step needed beyond scripts/install-hooks.sh.
+#
+# Human-only commits bypass both hooks the same way: git commit --no-verify
+
+if [ -f .git/hooks/pre-commit ]; then
+  if ! .git/hooks/pre-commit "$@"; then
+    echo "Local pre-commit hook failed, please see output above" >&2
+    exit 1
+  fi
+fi
+
+if command -v ggshield >/dev/null 2>&1; then
+  ggshield secret scan pre-commit "$@"
+else
+  echo "⚠ ggshield not found on PATH — secret scan skipped for this commit." >&2
+fi
