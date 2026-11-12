@@ -10,6 +10,35 @@
 > # See what upstream has done since the pin (this looks; it merges nothing)
 > git fetch upstream && git log --oneline da29b69d..upstream/main
 > ```
+>
+> ### Before anyone runs this
+>
+> What upstream `v6.19.6` does by default, as read in its source at `da29b69d` on 2026-11-12 (the full review is in
+> the code-forked library, under `audits/free-claude-code/`):
+>
+> - **It listens on every network interface, with authentication off and a well-known default token.** `HOST`
+>   defaults to `0.0.0.0`, `PROXY_AUTH_ENABLED` to `false` and `ANTHROPIC_AUTH_TOKEN` to `freecc`
+>   (`src/free_claude_code/config/settings.py` lines 734-744; the auth check returns at once when auth is off,
+>   `src/free_claude_code/api/dependencies.py` lines 52-53). Any device on the same network could send model requests
+>   billed to your provider keys.
+> - **Set these before the first start**, in `~/.fcc/.env` (mode 600) or the process environment:
+>   - `HOST=127.0.0.1`
+>   - `PROXY_AUTH_ENABLED=true`
+>   - `ANTHROPIC_AUTH_TOKEN=` a long random value, never `freecc`
+>   - `FCC_OPEN_BROWSER=false`, unless a browser tab at every start is wanted
+>   - `LOG_LEVEL` left at `INFO` (at `DEBUG` whole conversations are written to the log) and every `LOG_RAW_*` flag
+>     left `false`
+>   - `MESSAGING_PLATFORM=none` and `ENABLE_WEB_SERVER_TOOLS=false`, for the two reasons below
+> - **We do not use the one-line installer or `fcc-update`.** Both fetch and run newer code than the reviewed
+>   revision: the installer asks GitHub for the latest release and runs that release's installer, checked only for
+>   shell syntax (`scripts/install.sh` lines 1739-1756), and installs from PyPI rather than from this fork;
+>   `fcc-update` always moves to the latest release the same way (`scripts/update/fcc-update` lines 17-18).
+> - **We do not enable the messaging bots (Discord, Telegram).** A message that reaches a configured bot starts a Claude
+>   Code session with `--dangerously-skip-permissions`, so permission checks are off
+>   (`src/free_claude_code/cli/managed/claude.py` lines 141 and 153).
+> - **Web search and fetch are on by default** (`ENABLE_WEB_SERVER_TOOLS`, `settings.py` lines 646-648). When a model
+>   asks, the server itself sends the search query to DuckDuckGo and fetches the address the model picks, from your own
+>   connection.
 
 ---
 
