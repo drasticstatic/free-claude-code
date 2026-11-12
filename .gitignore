@@ -7,10 +7,15 @@ __pycache__
 .venv
 agent_workspace
 .env
+/logs/
 server.log
-server.*.log
+/server.*.log
 debug-*.log
 .coverage
 llama_cache
 .smoke-results
+/test-results/
+.vscode
+/src/free_claude_code/assets/macos/fcc-desktop-*
+server.*.log
 .DS_Store
