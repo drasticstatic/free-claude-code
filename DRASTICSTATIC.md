@@ -47,7 +47,7 @@ upstream  →  this fork, at the reviewed pin  →  free-claude-code_private (th
 | `.claudeignore`: keeps secrets, dependencies, build output and media out of an agent's reading | `a73423b4` |
 | `.githooks/commit-msg` (commit attribution), `.githooks/pre-commit` (chains to a secret scan) and `scripts/install-hooks.sh` | `c8ce96df`, `0824b44c`, `853e46f7`, `58581b73`, `5d4474d9`, `d38fd826`, `225e2fe4` |
 | `CLAUDE.md` and `AGENTS.md`: the fleet's rules for agents. Upstream deleted its own versions in `e632c85b` and `4b0eef6f`; ours are kept | `aadc297c`, `e8017387`, `853e46f7`, `58581b73`, `1e4c7bdf`, and the commits after the merge |
-| `AGENT-SYNC_PUBLIC/`: the fleet's public coordination folder | `c8ce96df`, `9490ceb4`, `5ccef5b8`, `0824b44c`, `0c7fe73d` |
+| The fleet's public coordination folder for helpers, at the root (one sub-folder per helper, and a README) | `c8ce96df`, `9490ceb4`, `5ccef5b8`, `0824b44c`, `0c7fe73d` |
 | `.gitignore`: rotated server logs (`server.*.log`) anywhere, and `.DS_Store` | `8a727135`, `a0fc0534` |
 | **Retired:** an edit to the old `api/models/anthropic.py` that let a message's `role` be `"system"`, `"ctx"` or `"msg"` as well as `"user"` and `"assistant"`. It was carried uncommitted from the summer, committed on its own so the record survives, and not ported: upstream removed that file, and its message model at the reviewed revision accepts `"system"` but not `"ctx"` or `"msg"` | `c478fac6` |
 | This page | the commit that adds it |
