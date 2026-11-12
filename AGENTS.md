@@ -2,15 +2,22 @@
 
 > This file is identical to CLAUDE.md. Keep them in sync.
 
-## ⚠ FIRST: sync this clone before you touch anything
+## ⚠ FIRST: sync this clone with our own `origin`, never with `upstream`
 
 ```sh
-git pull --rebase --autostash
+git pull --rebase --autostash origin
 ```
 
 Run this at the **start of every session**, before reading deeply or editing. Several agents and
-Christopher push to these repos — including Cosmos agents that run unattended while nobody is at the
-machine — so a clone can be behind by the time you open it.
+Christopher push to our fork, `origin` (`drasticstatic/free-claude-code`) — including Cosmos agents
+that run unattended while nobody is at the machine — so a clone can be behind by the time you open it.
+
+**This rule is for `origin` only. Never pull, merge or rebase from `upstream` as a routine.** This fork
+is pinned to an upstream revision that was read before it was merged ([`DRASTICSTATIC.md`](./DRASTICSTATIC.md)).
+A sync with `upstream` would bring in code nobody here has reviewed, which is exactly what the pin
+exists to prevent. Name the remote, as above, so a bare `git pull` can never follow `upstream` by
+accident. A newer upstream revision comes in only as a deliberate merge of one named commit, after
+that commit has been reviewed the same way, with `DRASTICSTATIC.md` changed on the same branch.
 
 **`--autostash` is what makes this safe on a dirty tree.** It stashes uncommitted changes, rebases
 onto the remote, then reapplies them. Your in-progress work survives. Without it, `git pull --rebase`
@@ -26,8 +33,9 @@ Why it matters more than it sounds:
   else changed the same lines, and you want to know that *before* building on top of them.
 
 **Fresh clone?** Also run `sh scripts/install-hooks.sh` — git hooks are not version-controlled, so
-the commit-attribution hook stays inert until this clone is pointed at `.githooks/`. Details:
-[`scripts/README.md`](./scripts/README.md).
+the commit-attribution hook stays inert until this clone is pointed at `.githooks/`. Details: the
+header of [`scripts/install-hooks.sh`](./scripts/install-hooks.sh) and of
+[`.githooks/commit-msg`](./.githooks/commit-msg).
 
 ---
 
