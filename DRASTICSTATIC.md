@@ -36,8 +36,7 @@ upstream  →  this fork, at the reviewed pin  →  free-claude-code_private (th
 - Nothing updates itself: no scheduled sync from upstream, no auto-merge, no install-time fetch of newer code. That is
   why we do not use upstream's one-line installer or its `fcc-update` command: both fetch and run newer code than the
   reviewed revision.
-- Our own patches (a log-retention change that moves old logs aside instead of deleting them, and our launch
-  wrappers) live in the private working copy. None is offered upstream yet.
+- Our own patches, launch wrappers and notes live in the private working copy. None is offered upstream yet.
 
 ## Our changes in this fork
 
