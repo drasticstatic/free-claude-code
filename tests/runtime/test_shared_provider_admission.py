@@ -1,0 +1,378 @@
+"""Admission protections survive replacement of their provider clients."""
+
+import asyncio
+from typing import cast
+from unittest.mock import AsyncMock, patch
+
+import httpx
+import pytest
+
+from free_claude_code.config.settings import Settings
+from free_claude_code.providers.admission import ProviderOperationKind
+from free_claude_code.providers.admission_policy import ProviderAdmissionLimits
+from free_claude_code.providers.admission_registry import ProviderAdmissionRegistry
+from free_claude_code.providers.nvidia_nim import NvidiaNimProvider
+from free_claude_code.runtime.provider_manager import ProviderRuntimeManager
+from tests.providers.test_provider_admission import _open, _status_error
+from tests.runtime.test_provider_manager import RuntimeFactory
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protection", ["concurrency", "rate", "recovery"])
+async def test_replacement_cannot_bypass_existing_protection(protection: str) -> None:
+    settings = Settings(
+        nvidia_nim_api_keys="test-key",
+        provider_rate_limit=1 if protection == "rate" else 1000,
+        provider_rate_window=60,
+        provider_max_concurrency=1,
+    )
+    manager = ProviderRuntimeManager(settings)
+    old_lease = await manager.acquire()
+    pending = None
+    old_attempt = None
+    try:
+        old = cast(
+            NvidiaNimProvider,
+            await manager._current.runtime.resolve_provider("nvidia_nim"),
+        )
+        old_attempt = await old._admission.start_execution(model="model").open_attempt(
+            ProviderOperationKind.GENERATION
+        )
+        if protection == "recovery":
+            response = httpx.Response(
+                503,
+                headers={"retry-after": "60"},
+                request=httpx.Request("POST", "https://provider.test"),
+            )
+            await old_attempt.fail(
+                httpx.HTTPStatusError(
+                    "unavailable", request=response.request, response=response
+                )
+            )
+        else:
+            await old_attempt.accept()
+        if protection != "concurrency":
+            await old_attempt.aclose()
+
+        with patch.object(
+            NvidiaNimProvider, "list_model_infos", AsyncMock(return_value=frozenset())
+        ):
+            await manager.replace(
+                settings.model_copy(update={"log_raw_sse_events": True}),
+                commit=AsyncMock(),
+            )
+            new = cast(
+                NvidiaNimProvider,
+                await manager._current.runtime.resolve_provider("nvidia_nim"),
+            )
+            pending = asyncio.create_task(
+                new._admission.start_execution(model="model").open_attempt(
+                    ProviderOperationKind.GENERATION
+                )
+            )
+            await asyncio.sleep(0)
+            assert not pending.done(), f"replacement bypassed {protection}"
+    finally:
+        if pending is not None:
+            pending.cancel()
+            outcomes = await asyncio.gather(pending, return_exceptions=True)
+            if not isinstance(outcomes[0], BaseException):
+                await outcomes[0].aclose()
+        if old_attempt is not None:
+            await old_attempt.aclose()
+        await old_lease.release()
+        await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+async def test_limits_publish_only_with_successful_settings(outcome):
+    settings = Settings(provider_rate_limit=1000, provider_max_concurrency=1)
+    manager = ProviderRuntimeManager(settings, runtime_factory=RuntimeFactory())
+    controller = manager._admission_registry.get("nvidia_nim")
+    first = await controller.start_execution().open_attempt(
+        ProviderOperationKind.GENERATION
+    )
+    pending = asyncio.create_task(
+        controller.start_execution().open_attempt(ProviderOperationKind.GENERATION)
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def commit():
+        entered.set()
+        await release.wait()
+        if outcome == "failure":
+            raise OSError("cannot save")
+
+    replacement = asyncio.create_task(
+        manager.replace(
+            settings.model_copy(update={"provider_max_concurrency": 2}), commit=commit
+        )
+    )
+    await entered.wait()
+    assert not pending.done()
+    if outcome == "cancel":
+        replacement.cancel()
+    else:
+        release.set()
+    results = await asyncio.gather(replacement, return_exceptions=True)
+    if outcome == "success":
+        assert results == [2]
+        await (await asyncio.wait_for(pending, 1)).aclose()
+    else:
+        assert isinstance(results[0], BaseException)
+        await asyncio.sleep(0)
+        assert not pending.done()
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+    await first.aclose()
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_blocked_publication_keeps_old_limits_until_generation_switch():
+    settings = Settings(provider_rate_limit=1000, provider_max_concurrency=1)
+    manager = ProviderRuntimeManager(settings, runtime_factory=RuntimeFactory())
+    controller = manager._admission_registry.get("nvidia_nim")
+    first = await controller.start_execution().open_attempt(
+        ProviderOperationKind.GENERATION
+    )
+    pending = asyncio.create_task(
+        controller.start_execution().open_attempt(ProviderOperationKind.GENERATION)
+    )
+    committed = asyncio.Event()
+
+    async def commit():
+        committed.set()
+
+    await manager._publication_lock.acquire()
+    replacement = asyncio.create_task(
+        manager.replace(
+            settings.model_copy(update={"provider_max_concurrency": 2}), commit=commit
+        )
+    )
+    await committed.wait()
+    assert not pending.done()
+    assert manager.current_generation_id == 1
+    manager._publication_lock.release()
+    await replacement
+    await (await asyncio.wait_for(pending, 1)).aclose()
+    await first.aclose()
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_old_lazy_construction_uses_current_limits_and_survives_retirement():
+    settings = Settings(
+        nvidia_nim_api_keys="test", provider_rate_limit=1000, provider_max_concurrency=1
+    )
+    manager = ProviderRuntimeManager(settings)
+    old_lease = await manager.acquire()
+    old_runtime = manager._current.runtime
+    with patch.object(
+        NvidiaNimProvider, "list_model_infos", AsyncMock(return_value=frozenset())
+    ):
+        await manager.replace(
+            settings.model_copy(update={"provider_max_concurrency": 2}),
+            commit=AsyncMock(),
+        )
+        old = cast(NvidiaNimProvider, await old_runtime.resolve_provider("nvidia_nim"))
+        new = cast(
+            NvidiaNimProvider,
+            await manager._current.runtime.resolve_provider("nvidia_nim"),
+        )
+        first = await old._admission.start_execution(model="model").open_attempt(
+            ProviderOperationKind.GENERATION
+        )
+        second = await asyncio.wait_for(
+            new._admission.start_execution(model="model").open_attempt(
+                ProviderOperationKind.GENERATION
+            ),
+            1,
+        )
+        blocked = asyncio.create_task(
+            new._admission.start_execution(model="model").open_attempt(
+                ProviderOperationKind.GENERATION
+            )
+        )
+        await asyncio.sleep(0)
+        assert not blocked.done()
+        blocked.cancel()
+        await asyncio.gather(blocked, return_exceptions=True)
+        await first.aclose()
+        await second.aclose()
+        await old_lease.release()
+        await asyncio.wait_for(
+            new._admission.start_execution(model="model").run_call(
+                AsyncMock(return_value="ok"),
+                operation_kind=ProviderOperationKind.GENERATION,
+            ),
+            1,
+        )
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_separate_provider_ids_and_managers_have_independent_capacity():
+    limits = ProviderAdmissionLimits(1, 60, 1)
+    registry = ProviderAdmissionRegistry(limits)
+    other = ProviderAdmissionRegistry(limits)
+    attempts = []
+    for owner, provider in [(registry, "one"), (registry, "two"), (other, "one")]:
+        attempts.append(
+            await asyncio.wait_for(
+                owner.get(provider)
+                .start_execution()
+                .open_attempt(ProviderOperationKind.GENERATION),
+                1,
+            )
+        )
+    for attempt in attempts:
+        await attempt.aclose()
+    registry.close()
+    other.close()
+
+
+@pytest.mark.asyncio
+async def test_custom_registry_entry_lives_until_retired_generation_cleanup_succeeds():
+    from free_claude_code.config.custom_providers import CustomProviderDefinition
+
+    custom_id = "custom_12345678123412341234123456789abc"
+    settings = Settings(
+        custom_providers=(
+            CustomProviderDefinition(
+                provider_id=custom_id,
+                display_name="Example",
+                base_url="https://example.test/v1",
+                api_format="openai_chat",
+            ),
+        )
+    )
+    factory = RuntimeFactory()
+    manager = ProviderRuntimeManager(settings, runtime_factory=factory)
+    lease = await manager.acquire()
+    controller = manager._admission_registry.get(custom_id)
+    execution = controller.start_execution(model="model")
+    attempt = await _open(execution)
+    await attempt.fail(_status_error(503, retry_after="60"))
+    await attempt.aclose()
+    execution.abandon()
+    timer = controller._expiry_timer
+    assert timer is not None
+    await manager.replace(
+        settings.model_copy(update={"custom_providers": ()}), commit=AsyncMock()
+    )
+    assert manager._admission_registry.get(custom_id) is controller
+    factory.runtimes[0].cleanup_error = OSError("not closed yet")
+    await lease.release()
+    assert manager._admission_registry.get(custom_id) is controller
+    assert controller._expiry_timer is timer and not timer.cancelled()
+    factory.runtimes[0].cleanup_error = None
+    await manager._close_generation(manager._retired[1], forced=False)
+    assert custom_id not in manager._admission_registry._controllers
+    assert timer.cancelled()
+    assert not controller._episodes
+    await manager.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        manager._admission_registry.get("nvidia_nim")
+
+
+@pytest.mark.asyncio
+async def test_history_cache_survives_settings_and_key_replacement_but_clears_on_close():
+    from free_claude_code.core.history_replay import HistoryMode, ReplayOrigin
+    from free_claude_code.providers.history_negotiation import HistoryNegotiation
+
+    settings = Settings(nvidia_nim_api_keys="first-key", provider_rate_limit=1000000)
+    manager = ProviderRuntimeManager(settings)
+    lease = await manager.acquire()
+    cache = manager._history_cache
+    origin = ReplayOrigin(
+        "NVIDIA_NIM", "chat", "https://provider.test/v1", "first-account", "model"
+    )
+    body = {
+        "model": "model",
+        "messages": [
+            {"role": "assistant", "content": "Answer", "reasoning_content": "Old"},
+            {"role": "user", "content": "Next"},
+        ],
+    }
+    state = HistoryNegotiation(cache, origin)
+    state.prepare(body, origin)
+    state.rejected()
+    state.prepare(body, origin)
+    state.accepted()
+    try:
+        old = cast(
+            NvidiaNimProvider,
+            await manager._current.runtime.resolve_provider("nvidia_nim"),
+        )
+        assert old._chat._history_cache is cache
+        with patch.object(
+            NvidiaNimProvider, "list_model_infos", AsyncMock(return_value=frozenset())
+        ):
+            replacement = Settings(
+                nvidia_nim_api_keys="second-key", provider_rate_limit=1000000
+            )
+            await manager.replace(replacement, commit=AsyncMock())
+            new = cast(
+                NvidiaNimProvider,
+                await manager._current.runtime.resolve_provider("nvidia_nim"),
+            )
+        assert old is not new
+        assert new._chat._history_cache is cache
+        assert (
+            HistoryNegotiation(new._chat._history_cache, origin).mode
+            is HistoryMode.CURRENT
+        )
+    finally:
+        await lease.release()
+        await manager.close()
+    assert HistoryNegotiation(cache, origin).mode is HistoryMode.ALL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind", ["anthropic", "openai_chat", "openai_responses", "anthropic_messages"]
+)
+async def test_exceptional_factories_retain_history_cache_across_replacement(kind):
+    from free_claude_code.core.history_replay import HistoryMode
+    from tests.config.test_custom_providers import definition
+
+    custom = definition(
+        api_format=kind if kind != "anthropic" else "openai_chat", api_key="first"
+    )
+    settings = Settings(
+        anthropic_api_keys="first",
+        custom_providers=() if kind == "anthropic" else (custom,),
+    )
+    provider_id = "anthropic" if kind == "anthropic" else custom.provider_id
+    manager = ProviderRuntimeManager(settings)
+    lease = await manager.acquire()
+    cache = manager._history_cache
+    key = (provider_id, "https://provider.test", "messages", "model")
+    cache.update(key, 0, HistoryMode.NONE)
+    try:
+        old = await manager._current.runtime.resolve_provider(provider_id)
+        assert old._history_cache is cache
+        replacement = settings.model_copy(
+            update={
+                "anthropic_api_keys": Settings(
+                    anthropic_api_keys="second"
+                ).anthropic_api_keys,
+                "custom_providers": ()
+                if kind == "anthropic"
+                else (custom.model_copy(update={"api_key": "second"}),),
+            }
+        )
+        with patch.object(
+            type(old), "list_model_infos", AsyncMock(return_value=frozenset())
+        ):
+            await manager.replace(replacement, commit=AsyncMock())
+            new = await manager._current.runtime.resolve_provider(provider_id)
+        assert new is not old
+        assert new._history_cache is cache
+        assert new._history_cache.read(key).mode is HistoryMode.NONE
+    finally:
+        await lease.release()
+        await manager.close()
+    assert cache.read(key).mode is None

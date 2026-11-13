@@ -1,0 +1,144 @@
+"""LM Studio provider implementation (OpenAI-compatible chat completions).
+
+Switched from LM Studio's native Anthropic Messages endpoint (2026-07-04):
+the newer ``/v1/messages`` path renders Claude Code conversations through the
+model's jinja chat template with strict role-alternation rules and a fragile
+``[TOOL_CALLS]`` parser — observed leaking control tokens into tool names
+(``[TOOL_CALLS]Read``) and dumping whole tool calls into text
+(``Read[ARGS]{...}``), which ends agent runs silently. The OpenAI
+``/v1/chat/completions`` path is LM Studio's mature parsing route, and fcc's
+OpenAI provider layers its own native tool-call assembly and think-tag parsing on top.
+"""
+
+import asyncio
+import time
+from collections.abc import Mapping
+from typing import Any
+
+import httpx2
+from loguru import logger
+from openai import Omit
+
+from free_claude_code.core.anthropic import ReasoningReplayMode
+from free_claude_code.core.reasoning import ReasoningEffort
+from free_claude_code.providers.admission import ProviderAdmissionController
+from free_claude_code.providers.base import ProviderConfig
+from free_claude_code.providers.failure_policy import (
+    context_window_exceeded_provider_failure,
+)
+from free_claude_code.providers.history_negotiation import HistoryModeCache
+from free_claude_code.providers.openai_chat import (
+    NamedEffortReasoning,
+    OpenAIChatProfile,
+    OpenAIChatProvider,
+    OpenAIChatRequestPolicy,
+)
+
+from .tokens import estimate_prepared_input_tokens
+
+_PROFILE = OpenAIChatProfile(
+    OpenAIChatRequestPolicy(
+        provider_name="LMSTUDIO",
+        reasoning_replay=ReasoningReplayMode.REASONING_CONTENT,
+    ),
+    NamedEffortReasoning(
+        (
+            (ReasoningEffort.MINIMAL, "low"),
+            (ReasoningEffort.LOW, "low"),
+            (ReasoningEffort.MEDIUM, "medium"),
+            (ReasoningEffort.HIGH, "high"),
+            (ReasoningEffort.XHIGH, "high"),
+            (ReasoningEffort.MAX, "high"),
+        ),
+        disabled_value="none",
+        enabled_value="high",
+        budget_field="reasoning_tokens",
+        use_extra_body=True,
+    ),
+)
+
+
+class LMStudioProvider(OpenAIChatProvider):
+    """LM Studio via its OpenAI-compatible chat completions endpoint."""
+
+    # LM Studio truncates the stream silently (no terminal event) when the
+    # prompt exceeds the loaded context. Refuse clearly over-budget prompts
+    # up front as a context-window failure so protocol adapters can tell their
+    # clients to compact/retry instead of letting the stream die silently.
+    _CONTEXT_CACHE_TTL_S = 30.0
+
+    def __init__(
+        self,
+        config: ProviderConfig,
+        *,
+        admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
+    ):
+        super().__init__(
+            config,
+            profile=_PROFILE,
+            admission=admission,
+            history_cache=history_cache,
+            validate_prepared_body=self._validate_context_budget,
+        )
+        self._loaded_context_cache: tuple[float, int | None] | None = None
+        self._loaded_context_lock = asyncio.Lock()
+
+    async def _validate_context_budget(self, body: Mapping[str, Any]) -> None:
+        loaded_context = await self._loaded_context_length()
+        if loaded_context is None:
+            return
+        # The estimate is cl100k-based and undercounts local tokenizers
+        # (observed ~8% low vs devstral); a request above 90% of the loaded
+        # context is already past where client-side compaction should have
+        # fired, and letting it through risks a silent LM Studio truncation.
+        budget = int(loaded_context * 0.9)
+        estimate = estimate_prepared_input_tokens(body, budget=budget)
+        if estimate > budget:
+            raise context_window_exceeded_provider_failure(
+                f"Estimated provider input ({estimate} tokens) exceeds the safe "
+                f"LM Studio context budget ({budget} tokens; 90% of loaded "
+                f"context {loaded_context})."
+            )
+
+    async def _loaded_context_length(self) -> int | None:
+        """Best-effort loaded context length from LM Studio's REST API, cached."""
+        async with self._loaded_context_lock:
+            if self._loaded_context_cache is not None:
+                cached_at, cached_value = self._loaded_context_cache
+                if time.monotonic() - cached_at < self._CONTEXT_CACHE_TTL_S:
+                    return cached_value
+
+            value: int | None = None
+            try:
+                root = self._base_url
+                root = root[: -len("/v1")] if root.endswith("/v1") else root
+                response = await self._client.get(
+                    f"{root}/api/v0/models",
+                    cast_to=httpx2.Response,
+                    options={
+                        "timeout": 2.0,
+                        "max_retries": 0,
+                        "follow_redirects": False,
+                        "headers": {
+                            "Authorization": Omit(),
+                            "OpenAI-Organization": Omit(),
+                            "OpenAI-Project": Omit(),
+                        },
+                    },
+                )
+                loaded = [
+                    model.get("loaded_context_length")
+                    for model in response.json().get("data", [])
+                    if model.get("state") == "loaded"
+                    and isinstance(model.get("loaded_context_length"), int)
+                ]
+                # ponytail: single-model setups in practice; with several loaded
+                # models the most generous ceiling still makes a valid backstop.
+                value = max(loaded) if loaded else None
+            except Exception as error:  # unavailable metadata permits generation
+                logger.debug(
+                    "LMSTUDIO context validation unavailable: {}", type(error).__name__
+                )
+            self._loaded_context_cache = (time.monotonic(), value)
+            return value

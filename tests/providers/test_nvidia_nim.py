@@ -1,50 +1,319 @@
 import json
+from copy import deepcopy
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import openai
 import pytest
-from httpx import Request, Response
+from httpx2 import Request, Response
 
-from config.nim import NimSettings
-from providers.defaults import NVIDIA_NIM_DEFAULT_BASE
-from providers.nvidia_nim import NvidiaNimProvider
+from free_claude_code.config.constants import ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS
+from free_claude_code.config.provider_catalog import NVIDIA_NIM_DEFAULT_BASE
+from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
+from free_claude_code.core.failures import ExecutionFailure
+from free_claude_code.core.history_replay import (
+    ReplayOrigin,
+    ReplayRecord,
+    encode_replay,
+)
+from free_claude_code.core.openai_responses.models import OpenAIResponsesRequest
+from free_claude_code.core.reasoning import ReasoningPolicy
+from free_claude_code.providers.admission import UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS
+from free_claude_code.providers.nvidia_nim import NvidiaNimProvider
+from free_claude_code.providers.nvidia_nim.client import _PROFILE as NIM_PROFILE
+from free_claude_code.providers.nvidia_nim.tool_schema import (
+    NIM_TOOL_ARGUMENT_ALIASES_KEY,
+)
+from tests.providers.request_factory import make_messages_request
+from tests.providers.support import (
+    REASONING_OFF,
+    REASONING_ON,
+    SDKStreamDouble,
+    immediate_admission,
+    make_provider_config,
+    reasoning_for,
+)
+from tests.providers.test_history_transports import _events_for, _harness, _saved_reply
+from tests.providers.test_native_tool_arguments import tool_events
 
 
-# Mock data classes
-class MockMessage:
-    def __init__(self, role, content):
-        self.role = role
-        self.content = content
+def message(role, content):
+    return {"role": role, "content": content}
 
 
-class MockTool:
-    def __init__(self, name, description, input_schema):
-        self.name = name
-        self.description = description
-        self.input_schema = input_schema
+def tool(name, description, input_schema):
+    return {"name": name, "description": description, "input_schema": input_schema}
 
 
-class MockBlock:
-    def __init__(self, **kwargs):
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+def block(**fields):
+    return fields
 
 
-class MockRequest:
-    def __init__(self, **kwargs):
-        self.model = "test-model"
-        self.messages = [MockMessage("user", "Hello")]
-        self.max_tokens = 100
-        self.temperature = 0.5
-        self.top_p = 0.9
-        self.system = "System prompt"
-        self.stop_sequences = ["STOP"]
-        self.tools = []
-        self.extra_body = {}
-        self.thinking = MagicMock()
-        self.thinking.enabled = True
-        for k, v in kwargs.items():
-            setattr(self, k, v)
+def make_request(**overrides):
+    model = overrides.pop("model", "test-model")
+    overrides.setdefault("stop_sequences", ["STOP"])
+    return make_messages_request(model, **overrides)
+
+
+def _alias_provider():
+    return NvidiaNimProvider(
+        make_provider_config(api_key="a", base_url="https://provider.invalid/v1"),
+        admission=immediate_admission(max_attempts=4),
+    )
+
+
+def _alias_request(wire="messages", *, reasoning_history=False):
+    schema = {
+        "type": "object",
+        "properties": {"pattern": {"type": "string"}, "type": {"type": "string"}},
+        "required": ["pattern", "type"],
+        "additionalProperties": False,
+    }
+    history = [{"role": "user", "content": "Search"}]
+    if reasoning_history:
+        carrier = encode_replay(
+            ReplayRecord(
+                ReplayOrigin(
+                    "source", "chat", "https://source.invalid/v1", "a", "test"
+                ),
+                {
+                    "reasoning_details": [
+                        {
+                            "type": "reasoning.text",
+                            "text": "Need the tool.",
+                            "index": 0,
+                        }
+                    ]
+                },
+            )
+        )
+        history = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Need the tool.",
+                        "signature": carrier,
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "Grep",
+                        "id": "prior",
+                        "input": {"pattern": "needle", "type": "py"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "prior",
+                        "content": "result",
+                    },
+                ],
+            },
+        ]
+    if wire == "messages":
+        return make_request(
+            system=None,
+            messages=history,
+            tools=[tool("Grep", "Search file contents", schema)],
+        )
+    return OpenAIResponsesRequest.model_validate(
+        {
+            "model": "test-model",
+            "input": history,
+            "tools": [{"type": "function", "name": "Grep", "parameters": schema}],
+        }
+    )
+
+
+def _alias_events():
+    template = _events_for("chat")[0]
+    return [
+        {
+            **template,
+            "choices": [
+                {"index": 0, "delta": {"tool_calls": [call]}, "finish_reason": finish}
+            ],
+        }
+        for call, finish in [
+            (
+                {
+                    "index": 0,
+                    "id": "call_grep",
+                    "type": "function",
+                    "function": {
+                        "name": "Grep",
+                        "arguments": '{"pattern":"needle","_fcc_arg_',
+                    },
+                },
+                None,
+            ),
+            ({"index": 0, "function": {"arguments": 'type":"py"}'}}, "tool_calls"),
+        ]
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wire,correction",
+    [
+        ("messages", None),
+        ("responses", None),
+        ("messages", "chat_template"),
+        ("messages", "reasoning_content"),
+    ],
+)
+async def test_argument_aliases_survive_request_corrections(wire, correction):
+    request = _alias_request(wire, reasoning_history=correction == "reasoning_content")
+    if correction == "chat_template":
+        request.extra_body = {"chat_template": "custom_template"}
+    original = deepcopy(request.model_dump())
+
+    def responder(bodies):
+        if len(bodies) == 1 and correction:
+            return 400, {"message": f"Unsupported field: {correction}"}
+        return 200, _alias_events()
+
+    async with _harness("chat", responder, chat_provider_factory=_alias_provider) as (
+        _,
+        bodies,
+        provider,
+    ):
+        stream = (
+            provider.stream_messages
+            if wire == "messages"
+            else provider.stream_responses
+        )
+        saved = await _saved_reply(
+            stream(request, reasoning=ReasoningPolicy.on(budget_tokens=4096)), wire
+        )
+    if wire == "messages":
+        call = next(
+            block for block in saved[0]["content"] if block["type"] == "tool_use"
+        )
+        assert call["input"] == {"pattern": "needle", "type": "py"}
+        assert call["id"] == "call_grep"
+    else:
+        call = next(item for item in saved if item["type"] == "function_call")
+        assert json.loads(call["arguments"]) == {"pattern": "needle", "type": "py"}
+        assert call["call_id"] == "call_grep"
+    assert len(bodies) == (2 if correction else 1)
+    assert all(NIM_TOOL_ARGUMENT_ALIASES_KEY not in body for body in bodies)
+    if correction == "reasoning_content":
+        assert "reasoning_content" not in bodies[-1]["messages"][0]
+        assert "Need the tool." not in json.dumps(bodies[-1])
+    assert request.model_dump() == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("early_sse", [False, True])
+async def test_argument_aliases_survive_shared_history_correction(early_sse):
+    # Test adapter exercises the shared history path; native NIM disables details.
+    def provider_factory():
+        with patch(
+            "free_claude_code.providers.nvidia_nim.client._PROFILE",
+            replace(NIM_PROFILE, structured_reasoning_details=True),
+        ):
+            return _alias_provider()
+
+    request = _alias_request()
+    request.messages.insert(
+        0,
+        type(request.messages[0]).model_validate(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "redacted_thinking", "data": "opaque-original"},
+                ],
+            }
+        ),
+    )
+
+    def responder(bodies):
+        if len(bodies) == 1:
+            error = {
+                "code": "invalid_encrypted_content",
+                "message": "The encrypted content could not be verified.",
+            }
+            return (200, [{"error": error}]) if early_sse else (400, error)
+        return 200, _alias_events()
+
+    async with _harness("chat", responder, chat_provider_factory=provider_factory) as (
+        _,
+        bodies,
+        provider,
+    ):
+        saved = await _saved_reply(provider.stream_messages(request), "messages")
+    call = next(block for block in saved[0]["content"] if block["type"] == "tool_use")
+    assert call["input"] == {"pattern": "needle", "type": "py"}
+    assert len(bodies) == 2
+    assert "opaque-original" not in json.dumps(bodies[-1])
+    assert all(NIM_TOOL_ARGUMENT_ALIASES_KEY not in body for body in bodies)
+
+
+def _input_json_deltas(events):
+    deltas = []
+    for event in events:
+        if "event: content_block_delta" not in event:
+            continue
+        for line in event.splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = json.loads(line[6:])
+            delta = payload.get("delta", {})
+            if delta.get("type") == "input_json_delta":
+                deltas.append(delta.get("partial_json", ""))
+    return deltas
+
+
+def _tool_call_chunk(
+    *,
+    name,
+    arguments,
+    tool_id="call_1",
+    index=0,
+    finish_reason=None,
+):
+    mock_tc = MagicMock()
+    mock_tc.index = index
+    mock_tc.id = tool_id
+    mock_tc.function.name = name
+    mock_tc.function.arguments = arguments
+
+    mock_chunk = MagicMock()
+    mock_chunk.choices = [
+        MagicMock(
+            delta=MagicMock(content=None, reasoning_content="", tool_calls=[mock_tc]),
+            finish_reason=finish_reason,
+        )
+    ]
+    mock_chunk.usage = None
+    return mock_chunk
+
+
+def _content_chunk(
+    content,
+    *,
+    finish_reason=None,
+    reasoning_content=None,
+):
+    mock_chunk = MagicMock()
+    mock_chunk.choices = [
+        MagicMock(
+            delta=MagicMock(
+                content=content,
+                reasoning_content=reasoning_content,
+                tool_calls=None,
+            ),
+            finish_reason=finish_reason,
+        )
+    ]
+    mock_chunk.usage = None
+    return mock_chunk
 
 
 def _make_bad_request_error(message: str) -> openai.BadRequestError:
@@ -56,26 +325,31 @@ def _make_bad_request_error(message: str) -> openai.BadRequestError:
     return openai.BadRequestError(message, response=response, body=body)
 
 
-@pytest.fixture(autouse=True)
-def mock_rate_limiter():
-    """Mock the global rate limiter to prevent waiting."""
-    with patch("providers.openai_compat.GlobalRateLimiter") as mock:
-        instance = mock.get_scoped_instance.return_value
-        instance.wait_if_blocked = AsyncMock(return_value=False)
-
-        # execute_with_retry should call through to the actual function
-        async def _passthrough(fn, *args, **kwargs):
-            return await fn(*args, **kwargs)
-
-        instance.execute_with_retry = AsyncMock(side_effect=_passthrough)
-        yield instance
+def _make_internal_server_error(message: str) -> openai.InternalServerError:
+    response = Response(
+        status_code=500,
+        request=Request("POST", f"{NVIDIA_NIM_DEFAULT_BASE}/chat/completions"),
+    )
+    body = {
+        "error": {
+            "message": message,
+            "type": "internal_server_error",
+            "code": 500,
+        }
+    }
+    return openai.InternalServerError(message, response=response, body=body)
 
 
 @pytest.mark.asyncio
 async def test_init(provider_config):
     """Test provider initialization."""
-    with patch("providers.openai_compat.AsyncOpenAI") as mock_openai:
-        provider = NvidiaNimProvider(provider_config, nim_settings=NimSettings())
+    with patch(
+        "free_claude_code.providers.openai_chat.client.AsyncOpenAI"
+    ) as mock_openai:
+        provider = NvidiaNimProvider(
+            provider_config,
+            admission=immediate_admission(),
+        )
         assert provider._api_key == "test_key"
         assert provider._base_url == "https://test.api.nvidia.com/v1"
         mock_openai.assert_called_once()
@@ -84,17 +358,18 @@ async def test_init(provider_config):
 @pytest.mark.asyncio
 async def test_init_uses_configurable_timeouts():
     """Test that provider passes configurable read/write/connect timeouts to client."""
-    from providers.base import ProviderConfig
 
-    config = ProviderConfig(
+    config = make_provider_config(
         api_key="test_key",
         base_url="https://test.api.nvidia.com/v1",
         http_read_timeout=600.0,
         http_write_timeout=15.0,
         http_connect_timeout=5.0,
     )
-    with patch("providers.openai_compat.AsyncOpenAI") as mock_openai:
-        NvidiaNimProvider(config, nim_settings=NimSettings())
+    with patch(
+        "free_claude_code.providers.openai_chat.client.AsyncOpenAI"
+    ) as mock_openai:
+        NvidiaNimProvider(config, admission=immediate_admission())
         call_kwargs = mock_openai.call_args[1]
         timeout = call_kwargs["timeout"]
         assert timeout.read == 600.0
@@ -105,9 +380,12 @@ async def test_init_uses_configurable_timeouts():
 @pytest.mark.asyncio
 async def test_build_request_body(provider_config):
     """Test request body construction."""
-    provider = NvidiaNimProvider(provider_config, nim_settings=NimSettings())
-    req = MockRequest()
-    body = provider._build_request_body(req)
+    provider = NvidiaNimProvider(
+        provider_config,
+        admission=immediate_admission(),
+    )
+    req = make_request()
+    body = provider._chat._build_request_body(req, reasoning=reasoning_for(req))
 
     assert body["model"] == "test-model"
     assert body["temperature"] == 0.5
@@ -115,26 +393,133 @@ async def test_build_request_body(provider_config):
     assert body["messages"][0]["role"] == "system"
     assert body["messages"][0]["content"] == "System prompt"
 
-    assert "extra_body" in body
-    ctk = body["extra_body"]["chat_template_kwargs"]
-    assert ctk["thinking"] is True
-    assert ctk["enable_thinking"] is True
-    assert ctk["reasoning_budget"] == body["max_tokens"]
-    assert "reasoning_budget" not in body["extra_body"]
+    assert "extra_body" not in body
+    assert body["reasoning_effort"] == "high"
+
+
+def test_responses_request_uses_nim_chat_policy(provider_config):
+    original_name = "mcp__responses__" + "x" * 80
+    provider = NvidiaNimProvider(
+        provider_config,
+        admission=immediate_admission(),
+    )
+    request = OpenAIResponsesRequest.model_validate(
+        {
+            "model": "test-model",
+            "input": "Hello",
+            "max_output_tokens": ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS + 1,
+            "top_p": 1.0,
+            "parallel_tool_calls": False,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": original_name,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"type": {"type": "string"}},
+                        "required": ["type"],
+                    },
+                }
+            ],
+        }
+    )
+
+    translated = provider._chat._build_responses_request_body(
+        request, reasoning=REASONING_ON
+    )
+
+    body = translated.body
+    tools = body["tools"]
+    assert isinstance(tools, list)
+    function = tools[0]["function"]
+    assert isinstance(function, dict)
+    wire_name = function["name"]
+    assert wire_name == translated.tool_names.encode(original_name)
+    assert wire_name != original_name
+    assert body["max_tokens"] == ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS
+    assert body["top_p"] == 1.0
+    assert body["parallel_tool_calls"] is False
+    assert body[NIM_TOOL_ARGUMENT_ALIASES_KEY] == {
+        original_name: {"_fcc_arg_type": "type"}
+    }
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    assert parameters["properties"] == {"_fcc_arg_type": {"type": "string"}}
+    assert "extra_body" not in body
+    assert body["reasoning_effort"] == "high"
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [(None, ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS), (128, 128)],
+)
+def test_responses_request_omits_sampling_defaults(
+    provider_config, requested, expected
+):
+    provider = NvidiaNimProvider(provider_config, admission=immediate_admission())
+    request = OpenAIResponsesRequest(
+        model="test-model",
+        input="Hello",
+        max_output_tokens=requested,
+        tools=[
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+        ],
+    )
+
+    body = provider._chat._build_responses_request_body(
+        request, reasoning=ReasoningPolicy.provider_default()
+    ).body
+
+    assert body["max_tokens"] == expected
+    assert "temperature" not in body
+    assert "top_p" not in body
+    assert "parallel_tool_calls" not in body
+    assert "extra_body" not in body
 
 
 @pytest.mark.asyncio
-async def test_build_request_body_omits_reasoning_when_globally_disabled(
+async def test_reasoning_rejection_preserves_normal_output_allowance():
+    request = _alias_request()
+    request.max_tokens = 64
+    original = deepcopy(request.model_dump())
+
+    def responder(bodies):
+        if len(bodies) == 1:
+            return 400, {"message": "Reasoning is mandatory and cannot be disabled."}
+        return 200, _alias_events()
+
+    async with _harness("chat", responder, chat_provider_factory=_alias_provider) as (
+        _,
+        bodies,
+        provider,
+    ):
+        await _saved_reply(
+            provider.stream_messages(request, reasoning=ReasoningPolicy.prefer_off()),
+            "messages",
+        )
+
+    assert len(bodies) == 2
+    assert bodies[0]["reasoning_effort"] == "none"
+    assert "reasoning_effort" not in bodies[1]
+    assert all(
+        body["max_tokens"] == ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS for body in bodies
+    )
+    assert request.model_dump() == original
+
+
+@pytest.mark.asyncio
+async def test_build_request_body_encodes_explicit_reasoning_off(
     provider_config,
 ):
     provider = NvidiaNimProvider(
-        provider_config.model_copy(update={"enable_thinking": False}),
-        nim_settings=NimSettings(),
+        provider_config,
+        admission=immediate_admission(),
     )
-    req = MockRequest()
-    body = provider._build_request_body(req)
+    req = make_request()
+    body = provider._chat._build_request_body(req, reasoning=REASONING_OFF)
 
     extra = body.get("extra_body", {})
+    assert body["reasoning_effort"] == "none"
     assert "chat_template_kwargs" not in extra
     assert "reasoning_budget" not in extra
 
@@ -143,58 +528,59 @@ async def test_build_request_body_omits_reasoning_when_globally_disabled(
 async def test_build_request_body_omits_reasoning_when_request_disables_thinking(
     provider_config,
 ):
-    provider = NvidiaNimProvider(provider_config, nim_settings=NimSettings())
-    req = MockRequest()
+    provider = NvidiaNimProvider(
+        provider_config,
+        admission=immediate_admission(),
+    )
+    req = make_request()
     req.thinking.enabled = False
-    body = provider._build_request_body(req)
+    body = provider._chat._build_request_body(req)
 
     extra = body.get("extra_body", {})
     assert "chat_template_kwargs" not in extra
     assert "reasoning_budget" not in extra
 
 
-def test_preflight_and_build_request_issue_206_post_tool_text(nim_provider):
+def test_startup_and_build_request_issue_206_post_tool_text(nim_provider):
     """Regression: assistant message with tool_use then text plus tool results (GitHub #206)."""
     tool_id = "toolu_issue_206"
-    req = MockRequest(
+    req = make_request(
         messages=[
-            MockMessage("user", "Use echo once."),
-            MockMessage(
+            message("user", "Use echo once."),
+            message(
                 "assistant",
                 [
-                    MockBlock(
+                    block(
                         type="tool_use",
                         id=tool_id,
                         name="echo_smoke",
                         input={"value": "FCC_206"},
                     ),
-                    MockBlock(
+                    block(
                         type="text",
                         text="Commentary after the tool row.",
                     ),
                 ],
             ),
-            MockMessage(
+            message(
                 "user",
                 [
-                    MockBlock(
-                        type="tool_result", tool_use_id=tool_id, content="FCC_206"
-                    ),
-                    MockBlock(type="text", text="What was echoed?"),
+                    block(type="tool_result", tool_use_id=tool_id, content="FCC_206"),
+                    block(type="text", text="What was echoed?"),
                 ],
             ),
         ],
     )
-    nim_provider.preflight_stream(req, thinking_enabled=False)
-    body = nim_provider._build_request_body(req, thinking_enabled=False)
+    nim_provider.stream_messages(req, reasoning=REASONING_OFF)
+    body = nim_provider._chat._build_request_body(req, reasoning=REASONING_OFF)
     assert "messages" in body
     assert any(m.get("role") == "tool" for m in body["messages"])
 
 
 @pytest.mark.asyncio
-async def test_stream_response_text(nim_provider):
+async def test_stream_messages_text(nim_provider):
     """Test streaming text response."""
-    req = MockRequest()
+    req = make_request()
 
     # Create mock chunks
     mock_chunk1 = MagicMock()
@@ -221,9 +607,9 @@ async def test_stream_response_text(nim_provider):
     with patch.object(
         nim_provider._client.chat.completions, "create", new_callable=AsyncMock
     ) as mock_create:
-        mock_create.return_value = mock_stream()
+        mock_create.return_value = SDKStreamDouble(mock_stream())
 
-        events = [e async for e in nim_provider.stream_response(req)]
+        events = [e async for e in nim_provider.stream_messages(req)]
 
         assert len(events) > 0
         assert "event: message_start" in events[0]
@@ -241,9 +627,9 @@ async def test_stream_response_text(nim_provider):
 
 
 @pytest.mark.asyncio
-async def test_stream_response_thinking_reasoning_content(nim_provider):
+async def test_stream_messages_thinking_reasoning_content(nim_provider):
     """Test streaming with native reasoning_content."""
-    req = MockRequest()
+    req = make_request()
 
     mock_chunk = MagicMock()
     mock_chunk.choices = [
@@ -253,16 +639,25 @@ async def test_stream_response_thinking_reasoning_content(nim_provider):
         )
     ]
     mock_chunk.usage = None
+    stop_chunk = MagicMock()
+    stop_chunk.choices = [
+        MagicMock(
+            delta=MagicMock(content=None, reasoning_content=None, tool_calls=None),
+            finish_reason="stop",
+        )
+    ]
+    stop_chunk.usage = None
 
     async def mock_stream():
         yield mock_chunk
+        yield stop_chunk
 
     with patch.object(
         nim_provider._client.chat.completions, "create", new_callable=AsyncMock
     ) as mock_create:
-        mock_create.return_value = mock_stream()
+        mock_create.return_value = SDKStreamDouble(mock_stream())
 
-        events = [e async for e in nim_provider.stream_response(req)]
+        events = [e async for e in nim_provider.stream_messages(req)]
 
         # Check for thinking_delta
         found_thinking = False
@@ -277,12 +672,12 @@ async def test_stream_response_thinking_reasoning_content(nim_provider):
 
 
 @pytest.mark.asyncio
-async def test_stream_response_suppresses_thinking_when_disabled(provider_config):
+async def test_stream_messages_suppresses_thinking_when_disabled(provider_config):
     provider = NvidiaNimProvider(
-        provider_config.model_copy(update={"enable_thinking": False}),
-        nim_settings=NimSettings(),
+        provider_config,
+        admission=immediate_admission(),
     )
-    req = MockRequest()
+    req = make_request()
 
     mock_chunk = MagicMock()
     mock_chunk.choices = [
@@ -301,9 +696,11 @@ async def test_stream_response_suppresses_thinking_when_disabled(provider_config
     with patch.object(
         provider._client.chat.completions, "create", new_callable=AsyncMock
     ) as mock_create:
-        mock_create.return_value = mock_stream()
+        mock_create.return_value = SDKStreamDouble(mock_stream())
 
-        events = [e async for e in provider.stream_response(req)]
+        events = [
+            e async for e in provider.stream_messages(req, reasoning=REASONING_OFF)
+        ]
 
     event_text = "".join(events)
     assert "thinking_delta" not in event_text
@@ -319,12 +716,15 @@ def _make_bad_request_error(message: str) -> openai.BadRequestError:
 
 
 @pytest.mark.asyncio
-async def test_stream_response_retries_without_chat_template(provider_config):
+async def test_stream_messages_retries_without_chat_template(provider_config):
     provider = NvidiaNimProvider(
         provider_config,
-        nim_settings=NimSettings(chat_template="custom_template"),
+        admission=immediate_admission(),
     )
-    req = MockRequest(model="mistralai/mixtral-8x7b-instruct-v0.1")
+    req = make_request(
+        model="mistralai/mixtral-8x7b-instruct-v0.1",
+        extra_body={"chat_template": "custom_template"},
+    )
 
     mock_chunk = MagicMock()
     mock_chunk.choices = [
@@ -345,29 +745,23 @@ async def test_stream_response_retries_without_chat_template(provider_config):
     with patch.object(
         provider._client.chat.completions, "create", new_callable=AsyncMock
     ) as mock_create:
-        mock_create.side_effect = [first_error, mock_stream()]
+        mock_create.side_effect = [first_error, SDKStreamDouble(mock_stream())]
 
-        events = [e async for e in provider.stream_response(req)]
+        events = [
+            e async for e in provider.stream_messages(req, reasoning=REASONING_ON)
+        ]
 
     assert mock_create.await_count == 2
 
     first_extra = mock_create.call_args_list[0].kwargs["extra_body"]
-    second_extra = mock_create.call_args_list[1].kwargs["extra_body"]
+    second_extra = mock_create.call_args_list[1].kwargs.get("extra_body", {})
 
     assert first_extra["chat_template"] == "custom_template"
-    assert first_extra["chat_template_kwargs"] == {
-        "thinking": True,
-        "enable_thinking": True,
-        "reasoning_budget": 100,
-    }
+    assert "chat_template_kwargs" not in first_extra
     assert "reasoning_budget" not in first_extra
 
     assert "chat_template" not in second_extra
-    assert second_extra["chat_template_kwargs"] == {
-        "thinking": True,
-        "enable_thinking": True,
-        "reasoning_budget": 100,
-    }
+    assert "chat_template_kwargs" not in second_extra
     assert "reasoning_budget" not in second_extra
 
     event_text = "".join(events)
@@ -376,30 +770,83 @@ async def test_stream_response_retries_without_chat_template(provider_config):
 
 
 @pytest.mark.asyncio
-async def test_stream_response_does_not_retry_unrelated_bad_request(provider_config):
+async def test_stream_messages_retries_without_chat_template_kwargs_issue_993(
+    provider_config,
+):
     provider = NvidiaNimProvider(
         provider_config,
-        nim_settings=NimSettings(chat_template="custom_template"),
+        admission=immediate_admission(),
     )
-    req = MockRequest(model="mistralai/mixtral-8x7b-instruct-v0.1")
+    req = make_request(
+        model="mistralai/mistral-small-4-119b-2603",
+        extra_body={"chat_template_kwargs": {"custom": "value"}},
+    )
+
+    mock_chunk = MagicMock()
+    mock_chunk.choices = [
+        MagicMock(
+            delta=MagicMock(content="OK", reasoning_content=""),
+            finish_reason="stop",
+        )
+    ]
+    mock_chunk.usage = MagicMock(completion_tokens=2)
+
+    async def mock_stream():
+        yield mock_chunk
+
+    first_error = _make_bad_request_error(
+        "chat_template is not supported for Mistral tokenizers."
+    )
+
+    with patch.object(
+        provider._client.chat.completions, "create", new_callable=AsyncMock
+    ) as mock_create:
+        mock_create.side_effect = [first_error, SDKStreamDouble(mock_stream())]
+
+        events = [
+            e async for e in provider.stream_messages(req, reasoning=REASONING_ON)
+        ]
+
+    assert mock_create.await_count == 2
+
+    first_extra = mock_create.call_args_list[0].kwargs["extra_body"]
+    second_kwargs = mock_create.call_args_list[1].kwargs
+
+    assert "chat_template" not in first_extra
+    assert first_extra["chat_template_kwargs"] == {"custom": "value"}
+    second_extra = second_kwargs.get("extra_body") or {}
+    assert "chat_template" not in second_extra
+    assert "chat_template_kwargs" not in second_extra
+
+    event_text = "".join(events)
+    assert "event: error" not in event_text
+    assert "OK" in event_text
+
+
+@pytest.mark.asyncio
+async def test_stream_messages_does_not_retry_unrelated_bad_request(provider_config):
+    provider = NvidiaNimProvider(
+        provider_config,
+        admission=immediate_admission(),
+    )
+    req = make_request(model="mistralai/mixtral-8x7b-instruct-v0.1")
 
     with patch.object(
         provider._client.chat.completions, "create", new_callable=AsyncMock
     ) as mock_create:
         mock_create.side_effect = _make_bad_request_error("unrelated bad request")
 
-        events = [e async for e in provider.stream_response(req)]
+        with pytest.raises(ExecutionFailure) as exc_info:
+            [e async for e in provider.stream_messages(req)]
 
     assert mock_create.await_count == 1
-    event_text = "".join(events)
-    assert "Invalid request sent to provider" in event_text
-    assert "event: message_stop" in event_text
+    assert "Invalid request sent to provider" in exc_info.value.message
 
 
 @pytest.mark.asyncio
 async def test_tool_call_stream(nim_provider):
     """Test streaming tool calls."""
-    req = MockRequest()
+    req = make_request()
 
     # Mock tool call delta
     mock_tc = MagicMock()
@@ -423,9 +870,9 @@ async def test_tool_call_stream(nim_provider):
     with patch.object(
         nim_provider._client.chat.completions, "create", new_callable=AsyncMock
     ) as mock_create:
-        mock_create.return_value = mock_stream()
+        mock_create.return_value = SDKStreamDouble(mock_stream())
 
-        events = [e async for e in nim_provider.stream_response(req)]
+        events = [e async for e in nim_provider.stream_messages(req)]
 
         starts = [
             e for e in events if "event: content_block_start" in e and '"tool_use"' in e
@@ -434,62 +881,396 @@ async def test_tool_call_stream(nim_provider):
         assert "search" in starts[0]
 
 
-@pytest.mark.asyncio
-async def test_stream_response_retries_without_reasoning_budget(nim_provider):
-    req = MockRequest()
+def _read_tools(wire):
+    schema = {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    }
+    return (
+        [{"type": "function", "name": "read", "parameters": schema}]
+        if wire == "responses"
+        else [tool("read", "Read a file", schema)]
+    )
 
-    mock_chunk = MagicMock()
-    mock_chunk.choices = [
-        MagicMock(
-            delta=MagicMock(content="Recovered", reasoning_content=""),
-            finish_reason="stop",
+
+_MINIMAX_MARKUP = (
+    ']<]minimax[>[<tool_call>]<]minimax[>[<invoke name="read">'
+    "]<]minimax[>[<path>README.md]<]minimax[>[</path>"
+    "]<]minimax[>[</invoke>]<]minimax[>[</tool_call>"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire", ["messages", "responses"])
+@pytest.mark.parametrize(
+    "model,parts,with_tools,field",
+    [
+        (
+            "minimaxai/minimax-m3.1-flash",
+            ["Example: " + _MINIMAX_MARKUP],
+            True,
+            "content",
+        ),
+        (
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            [_MINIMAX_MARKUP[:6], _MINIMAX_MARKUP[6:92], _MINIMAX_MARKUP[92:]],
+            True,
+            "content",
+        ),
+        (
+            "minimaxai/minimax-m3.1-flash",
+            ["The namespace is ]<]minimax[>[."],
+            False,
+            "content",
+        ),
+        (
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            ["]<]minimax[>[<tool_call>"],
+            False,
+            "content",
+        ),
+        ("minimaxai/minimax-m3.1-flash", [_MINIMAX_MARKUP], True, "reasoning_content"),
+    ],
+)
+async def test_minimax_markup_is_not_a_tool_call(wire, model, parts, with_tools, field):
+    template = _events_for("chat")[0]
+    upstream = [
+        {
+            **template,
+            "choices": [{"index": 0, "delta": {field: part}, "finish_reason": None}],
+        }
+        for part in parts
+    ]
+    upstream.append(
+        {
+            **template,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "content": "Visible answer." if field != "content" else ""
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+    )
+    async with _harness(
+        "chat", lambda _: (200, upstream), chat_provider_factory=_alias_provider
+    ) as (send, bodies, _):
+        saved = await _saved_reply(
+            send(
+                wire,
+                [{"role": "user", "content": "Explain this syntax."}],
+                model=model,
+                tools=_read_tools(wire) if with_tools else None,
+            ),
+            wire,
+        )
+    assert len(bodies) == 1
+    if wire == "messages":
+        blocks = saved[0]["content"]
+        assert not any(block["type"] == "tool_use" for block in blocks)
+        reasoning = "".join(block.get("thinking", "") for block in blocks)
+    else:
+        assert not any(item["type"] == "function_call" for item in saved)
+        blocks = [
+            block
+            for item in saved
+            if item["type"] == "message"
+            for block in item["content"]
+        ]
+        reasoning = "".join(
+            block["text"]
+            for item in saved
+            if item["type"] == "reasoning"
+            for block in item.get("content", [])
+        )
+    text = "".join(block.get("text", "") for block in blocks)
+    assert text == ("".join(parts) if field == "content" else "Visible answer.")
+    if field == "reasoning_content":
+        assert reasoning == "".join(parts)
+
+
+@pytest.mark.asyncio
+async def test_nim_normalization_preserves_reasoning_chunks(nim_provider):
+    chunks = [
+        _content_chunk(None, reasoning_content=_MINIMAX_MARKUP[:20]),
+        _content_chunk(
+            None, reasoning_content=_MINIMAX_MARKUP[20:], finish_reason="stop"
+        ),
+    ]
+
+    async def source():
+        for chunk in chunks:
+            yield chunk
+
+    normalized = [
+        chunk
+        async for chunk in nim_provider._behavior.normalize_stream(
+            source(), {"model": "minimaxai/minimax-m3.1-flash"}
         )
     ]
-    mock_chunk.usage = MagicMock(completion_tokens=5)
+    assert (
+        "".join(chunk.choices[0].delta.reasoning_content for chunk in normalized)
+        == _MINIMAX_MARKUP
+    )
+    assert all(chunk.choices[0].delta.tool_calls is None for chunk in normalized)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire", ["messages", "responses"])
+async def test_nim_structured_tool_arguments_are_preserved(wire):
+    arguments = '{ "path": "README.md", "options": {"count": 2, "enabled": true}, "tags": ["a", "b"] }'
+    async with _harness(
+        "chat",
+        lambda _: (200, tool_events("chat", arguments)),
+        chat_provider_factory=_alias_provider,
+    ) as (send, bodies, _):
+        events = [
+            event
+            async for event in send(
+                wire,
+                [{"role": "user", "content": "Read the file."}],
+                model="minimaxai/minimax-m3.1-flash",
+                tools=_read_tools(wire),
+            )
+        ]
+    parsed = parse_sse_text("".join(events))
+    assert len(bodies) == 1
+    if wire == "messages":
+        assert parsed[-1].event == "message_stop"
+        assert "".join(_input_json_deltas(events)) == arguments
+        call = next(
+            event.data["content_block"]
+            for event in parsed
+            if event.data.get("content_block", {}).get("type") == "tool_use"
+        )
+        assert call["id"] == "call_probe" and call["name"] == "read"
+    else:
+        assert parsed[-1].event == "response.completed"
+        call = parsed[-1].data["response"]["output"][0]
+        assert call["call_id"] == "call_probe" and call["name"] == "read"
+        assert call["arguments"] == arguments
+
+
+@pytest.mark.asyncio
+async def test_stream_messages_restores_aliased_tool_arguments(nim_provider):
+    """NIM-safe argument aliases are restored before Anthropic SSE emission."""
+    req = make_request(
+        tools=[
+            tool(
+                "Grep",
+                "Search file contents",
+                {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "-A": {"type": "number"},
+                        "type": {"type": "string"},
+                    },
+                    "required": ["pattern"],
+                },
+            )
+        ]
+    )
+    mock_chunk = _tool_call_chunk(
+        name="Grep",
+        arguments=json.dumps({"pattern": "needle", "-A": 2, "_fcc_arg_type": "py"}),
+    )
 
     async def mock_stream():
         yield mock_chunk
 
-    error = _make_bad_request_error("Unsupported field: reasoning_budget")
+    with patch.object(
+        nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+    ) as mock_create:
+        mock_create.return_value = SDKStreamDouble(mock_stream())
+
+        events = [e async for e in nim_provider.stream_messages(req)]
+
+    await_args = mock_create.await_args
+    assert await_args is not None
+    create_kwargs = await_args.kwargs
+    assert NIM_TOOL_ARGUMENT_ALIASES_KEY not in create_kwargs
+    properties = create_kwargs["tools"][0]["function"]["parameters"]["properties"]
+    assert "-A" in properties
+    assert "type" not in properties
+    assert "_fcc_arg_A" not in properties
+    assert "_fcc_arg_type" in properties
+
+    deltas = _input_json_deltas(events)
+    assert len(deltas) == 1
+    assert json.loads(deltas[0]) == {"pattern": "needle", "-A": 2, "type": "py"}
+    assert "_fcc_arg_type" not in deltas[0]
+
+
+@pytest.mark.asyncio
+async def test_stream_messages_buffers_chunked_aliased_tool_arguments(nim_provider):
+    """Chunked aliased args are emitted once as restored Claude Code args."""
+    req = make_request(
+        tools=[
+            tool(
+                "Grep",
+                "Search file contents",
+                {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "type": {"type": "string"},
+                    },
+                    "required": ["pattern"],
+                },
+            )
+        ]
+    )
+    first_chunk = _tool_call_chunk(
+        name="Grep",
+        arguments='{"pattern": "needle", ',
+        tool_id="call_chunked",
+    )
+    second_chunk = _tool_call_chunk(
+        name=None,
+        arguments='"_fcc_arg_type": "py"}',
+        tool_id="call_chunked",
+    )
+
+    async def mock_stream():
+        yield first_chunk
+        yield second_chunk
 
     with patch.object(
         nim_provider._client.chat.completions, "create", new_callable=AsyncMock
     ) as mock_create:
-        mock_create.side_effect = [error, mock_stream()]
+        mock_create.return_value = SDKStreamDouble(mock_stream())
 
-        events = [e async for e in nim_provider.stream_response(req)]
+        events = [e async for e in nim_provider.stream_messages(req)]
 
-    assert mock_create.await_count == 2
-    first_call = mock_create.await_args_list[0].kwargs
-    second_call = mock_create.await_args_list[1].kwargs
-    assert (
-        first_call["extra_body"]["chat_template_kwargs"]["reasoning_budget"]
-        == first_call["max_tokens"]
-    )
-    assert "reasoning_budget" not in second_call["extra_body"]
-    assert "reasoning_budget" not in second_call["extra_body"]["chat_template_kwargs"]
-    assert second_call["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
-    assert any("Recovered" in event for event in events)
-    assert any("message_stop" in event for event in events)
+    deltas = _input_json_deltas(events)
+    assert len(deltas) == 1
+    assert json.loads(deltas[0]) == {"pattern": "needle", "type": "py"}
 
 
 @pytest.mark.asyncio
-async def test_stream_response_retries_without_reasoning_content(nim_provider):
-    req = MockRequest(
+async def test_stream_messages_restores_nested_aliased_tool_arguments(nim_provider):
+    req = make_request(
+        tools=[
+            tool(
+                "NotionLike",
+                "Nested type schema",
+                {
+                    "type": "object",
+                    "properties": {
+                        "parent": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string"},
+                                "id": {"type": "string"},
+                            },
+                            "required": ["type", "id"],
+                        }
+                    },
+                    "required": ["parent"],
+                },
+            )
+        ]
+    )
+    mock_chunk = _tool_call_chunk(
+        name="NotionLike",
+        arguments=json.dumps(
+            {"parent": {"_fcc_arg_type": "page_id", "id": "page_123"}}
+        ),
+    )
+
+    async def mock_stream():
+        yield mock_chunk
+
+    with patch.object(
+        nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+    ) as mock_create:
+        mock_create.return_value = SDKStreamDouble(mock_stream())
+
+        events = [e async for e in nim_provider.stream_messages(req)]
+
+    deltas = _input_json_deltas(events)
+    assert len(deltas) == 1
+    assert json.loads(deltas[0]) == {"parent": {"type": "page_id", "id": "page_123"}}
+
+
+@pytest.mark.asyncio
+async def test_stream_messages_task_tool_preserves_background_true(nim_provider):
+    req = make_request(
+        tools=[
+            tool(
+                "Task",
+                "Run a subagent",
+                {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "run_in_background": {"type": "boolean"},
+                    },
+                    "required": ["description", "prompt"],
+                },
+            )
+        ]
+    )
+    mock_chunk = _tool_call_chunk(
+        name="Task",
+        arguments=json.dumps(
+            {
+                "description": "Inspect",
+                "prompt": "Read the marker",
+                "run_in_background": True,
+            }
+        ),
+        tool_id="call_task",
+    )
+
+    async def mock_stream():
+        yield mock_chunk
+
+    with patch.object(
+        nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+    ) as mock_create:
+        mock_create.return_value = SDKStreamDouble(mock_stream())
+
+        events = [e async for e in nim_provider.stream_messages(req)]
+
+    deltas = _input_json_deltas(events)
+    assert len(deltas) == 1
+    assert json.loads(deltas[0])["run_in_background"] is True
+
+
+@pytest.mark.asyncio
+async def test_stream_messages_retries_without_reasoning_content(nim_provider):
+    req = make_request(
         system=None,
         messages=[
-            MockMessage(
+            message(
                 "assistant",
                 [
-                    MockBlock(type="thinking", thinking="Need the tool."),
-                    MockBlock(
+                    block(type="thinking", thinking="Need the tool."),
+                    block(
                         type="tool_use",
                         id="toolu_reasoning",
                         name="echo_smoke",
                         input={"value": "FCC_TOOL"},
                     ),
                 ],
-            )
+            ),
+            message(
+                "user",
+                [
+                    block(
+                        type="tool_result",
+                        tool_use_id="toolu_reasoning",
+                        content="result",
+                    )
+                ],
+            ),
         ],
     )
 
@@ -510,25 +1291,26 @@ async def test_stream_response_retries_without_reasoning_content(nim_provider):
     with patch.object(
         nim_provider._client.chat.completions, "create", new_callable=AsyncMock
     ) as mock_create:
-        mock_create.side_effect = [error, mock_stream()]
+        mock_create.side_effect = [error, SDKStreamDouble(mock_stream())]
 
-        events = [e async for e in nim_provider.stream_response(req)]
+        events = [e async for e in nim_provider.stream_messages(req)]
 
     assert mock_create.await_count == 2
     first_call = mock_create.await_args_list[0].kwargs
     second_call = mock_create.await_args_list[1].kwargs
     assert first_call["messages"][0]["reasoning_content"] == "Need the tool."
     assert "reasoning_content" not in second_call["messages"][0]
+    assert "Need the tool." not in json.dumps(second_call)
     assert second_call["messages"][0]["tool_calls"][0]["id"] == "toolu_reasoning"
     assert any("Recovered" in event for event in events)
     assert any("message_stop" in event for event in events)
 
 
 @pytest.mark.asyncio
-async def test_stream_response_bad_request_without_reasoning_budget_does_not_retry(
+async def test_stream_messages_bad_request_without_reasoning_budget_does_not_retry(
     nim_provider,
 ):
-    req = MockRequest()
+    req = make_request()
     error = _make_bad_request_error("Unsupported field: top_k")
 
     with patch.object(
@@ -536,8 +1318,56 @@ async def test_stream_response_bad_request_without_reasoning_budget_does_not_ret
     ) as mock_create:
         mock_create.side_effect = error
 
-        events = [e async for e in nim_provider.stream_response(req)]
+        with pytest.raises(ExecutionFailure) as exc_info:
+            [e async for e in nim_provider.stream_messages(req)]
 
     assert mock_create.await_count == 1
-    assert any("Invalid request sent to provider" in event for event in events)
-    assert any("message_stop" in event for event in events)
+    assert "Invalid request sent to provider" in exc_info.value.message
+
+
+@pytest.mark.asyncio
+async def test_stream_messages_unrelated_internal_error_does_not_downgrade(
+    nim_provider,
+):
+    req = make_request()
+    error = _make_internal_server_error("unrelated internal provider failure")
+
+    with patch.object(
+        nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+    ) as mock_create:
+        mock_create.side_effect = error
+
+        with pytest.raises(ExecutionFailure) as exc_info:
+            [e async for e in nim_provider.stream_messages(req)]
+
+    assert mock_create.await_count == UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS
+    assert all(
+        call.kwargs == mock_create.await_args_list[0].kwargs
+        for call in mock_create.await_args_list
+    )
+    assert "Provider API request failed" in exc_info.value.message
+
+
+@pytest.mark.asyncio
+async def test_stream_messages_internal_reasoning_content_error_does_not_downgrade(
+    nim_provider,
+):
+    req = make_request()
+    error = _make_internal_server_error(
+        "reasoning_content could not be processed by the upstream model"
+    )
+
+    with patch.object(
+        nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+    ) as mock_create:
+        mock_create.side_effect = error
+
+        with pytest.raises(ExecutionFailure) as exc_info:
+            [e async for e in nim_provider.stream_messages(req)]
+
+    assert mock_create.await_count == UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS
+    assert all(
+        call.kwargs == mock_create.await_args_list[0].kwargs
+        for call in mock_create.await_args_list
+    )
+    assert "Provider API request failed" in exc_info.value.message
